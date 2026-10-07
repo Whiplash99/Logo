@@ -1,0 +1,1151 @@
+<script>
+/* =============================================================================
+   DoAT Aerodrome Standards Portal — client application (SPA)
+   Hash-routed single page app. All server calls go through api(action, payload)
+   which wraps the central google.script.run.api dispatcher in a Promise.
+   ============================================================================= */
+(function () {
+  'use strict';
+
+  var BOOT = window.BOOTSTRAP || {};
+  var App = { boot: BOOT, view: null, lastSearch: null };
+
+  /* ---- server bridge ------------------------------------------------------ */
+  function api(action, payload) {
+    return new Promise(function (resolve, reject) {
+      google.script.run
+        .withSuccessHandler(function (res) {
+          if (res && res.ok) { resolve(res.data); }
+          else { reject(new Error(res && res.error ? res.error : 'Request failed')); }
+        })
+        .withFailureHandler(function (err) { reject(err); })
+        .api(action, payload || {});
+    });
+  }
+
+  /* ---- small helpers ------------------------------------------------------ */
+  var $ = function (sel, root) { return (root || document).querySelector(sel); };
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function badgeClass(t) {
+    t = String(t || '').toLowerCase();
+    if (t.indexOf('standard') === 0) return 'standard';
+    if (t.indexOf('recommended') !== -1) return 'recommended';
+    if (t.indexOf('note') !== -1) return 'note';
+    if (t.indexOf('definition') !== -1) return 'definition';
+    if (t.indexOf('guidance') !== -1 || t.indexOf('procedure') !== -1) return 'guidance';
+    return 'other';
+  }
+  function provisionBadge(t) {
+    if (!t || t === 'Unclassified') return '';
+    return '<span class="badge ' + badgeClass(t) + '">' + esc(t) + '</span>';
+  }
+  function toast(msg, kind) {
+    var el = document.createElement('div');
+    el.className = 'toast glass-strong ' + (kind || 'info');
+    el.innerHTML = (kind === 'ok' ? '✓ ' : kind === 'err' ? '⚠ ' : 'ℹ ') + esc(msg);
+    $('#toasts').appendChild(el);
+    setTimeout(function () { el.style.opacity = '0'; el.style.transform = 'translateX(30px)'; setTimeout(function () { el.remove(); }, 300); }, kind === 'err' ? 5200 : 3200);
+  }
+  function loading(target) { (target || $('#view')).innerHTML = '<div class="loading"><div class="spinner"></div> Loading…</div>'; }
+  function errorBox(msg) { return '<div class="empty"><div class="big">⚠</div><div>' + esc(msg) + '</div></div>'; }
+  function debounce(fn, ms) { var t; return function () { var a = arguments, c = this; clearTimeout(t); t = setTimeout(function () { fn.apply(c, a); }, ms); }; }
+
+  /* ---- modal -------------------------------------------------------------- */
+  function openModal(html, wide) {
+    var box = $('#modalBox');
+    box.className = 'modal glass-strong' + (wide ? ' wide' : '');
+    box.innerHTML = '<span class="close" onclick="window.__closeModal()">✕</span>' + html;
+    $('#modal-root').classList.add('show');
+  }
+  window.__closeModal = function () { $('#modal-root').classList.remove('show'); };
+  $('#modalBackdrop').addEventListener('click', window.__closeModal);
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') window.__closeModal(); });
+
+  /* ---- navigation --------------------------------------------------------- */
+  var NAV = [
+    { group: '', items: [
+      { id: 'dashboard', label: 'Dashboard', icon: '▦' },
+      { id: 'search', label: 'Global Search', icon: '🔍' }
+    ]},
+    { group: 'Library', items: [
+      { id: 'library', label: 'Document Library', icon: '▤' },
+      { id: 'knowledge', label: 'Technical Knowledge', icon: '◆' },
+      { id: 'glossary', label: 'Technical Glossary', icon: 'Aa' }
+    ]},
+    { group: 'Research', items: [
+      { id: 'ask', label: 'Ask ICAO Reference', icon: '✦' },
+      { id: 'versions', label: 'Version Comparison', icon: '⇄' },
+      { id: 'recent', label: 'Recently Viewed', icon: '◷' }
+    ]},
+    { group: 'Workspace', items: [
+      { id: 'bookmarks', label: 'Bookmarks & Collections', icon: '★' },
+      { id: 'compliance', label: 'Compliance Mapping', icon: '✓', editor: true },
+      { id: 'reports', label: 'Reports & Exports', icon: '⤓' }
+    ]},
+    { group: 'System', items: [
+      { id: 'settings', label: 'Settings', icon: '⚙' },
+      { id: 'admin', label: 'Administration', icon: '◈', editor: true }
+    ]}
+  ];
+
+  function renderNav() {
+    var html = '';
+    NAV.forEach(function (sec) {
+      var items = sec.items.filter(function (it) {
+        if (it.admin && !BOOT.isAdmin) return false;
+        if (it.editor && !BOOT.isEditor) return false;
+        return true;
+      });
+      if (!items.length) return;
+      if (sec.group) html += '<div class="nav-group-label">' + sec.group + '</div>';
+      items.forEach(function (it) {
+        html += '<div class="nav-item" data-route="' + it.id + '"><span class="ic">' + it.icon + '</span>' + esc(it.label) + '</div>';
+      });
+    });
+    $('#nav').innerHTML = html;
+    Array.prototype.forEach.call(document.querySelectorAll('.nav-item'), function (el) {
+      el.addEventListener('click', function () { go(el.getAttribute('data-route')); closeSidebar(); });
+    });
+  }
+  function setActiveNav(route) {
+    Array.prototype.forEach.call(document.querySelectorAll('.nav-item'), function (el) {
+      el.classList.toggle('active', el.getAttribute('data-route') === route);
+    });
+  }
+
+  /* ---- router ------------------------------------------------------------- */
+  function go(path) { location.hash = '#/' + path; }
+  function parseHash() {
+    var h = location.hash.replace(/^#\/?/, '');
+    var qIndex = h.indexOf('?');
+    var query = {};
+    if (qIndex !== -1) {
+      h.substring(qIndex + 1).split('&').forEach(function (kv) {
+        var p = kv.split('='); query[decodeURIComponent(p[0])] = decodeURIComponent(p[1] || '');
+      });
+      h = h.substring(0, qIndex);
+    }
+    var parts = h.split('/').filter(Boolean);
+    return { base: parts[0] || 'dashboard', parts: parts, query: query };
+  }
+
+  var ROUTES = {
+    dashboard: viewDashboard,
+    search: viewSearch,
+    library: viewLibrary,
+    doc: viewDocument,
+    section: viewSection,
+    knowledge: viewKnowledge,
+    subject: viewSubject,
+    glossary: viewGlossary,
+    ask: viewAsk,
+    versions: viewVersions,
+    recent: viewRecent,
+    bookmarks: viewBookmarks,
+    compliance: viewCompliance,
+    reports: viewReports,
+    settings: viewSettings,
+    admin: viewAdmin
+  };
+
+  function route() {
+    var r = parseHash();
+    App.route = r;
+    var navId = (r.base === 'doc' || r.base === 'section') ? 'library' : r.base;
+    setActiveNav(ROUTES[r.base] ? r.base : navId);
+    var fn = ROUTES[r.base] || viewDashboard;
+    try { fn(r); } catch (e) { $('#view').innerHTML = errorBox(e.message); }
+    window.scrollTo(0, 0);
+  }
+
+  /* ======================================================================== *
+   *  VIEWS
+   * ======================================================================== */
+
+  /* ---- Dashboard ---------------------------------------------------------- */
+  function viewDashboard() {
+    loading();
+    Promise.all([
+      api('dashboard.stats'), api('dashboard.recent'), api('dashboard.frequent'), api('docs.list', {})
+    ]).then(function (res) {
+      var stats = res[0], recent = res[1], freq = res[2], docs = res[3];
+      var h = '';
+      h += '<div class="page-title">Welcome' + (BOOT.user ? ', ' + esc(BOOT.user.displayName) : '') + '</div>';
+      h += '<div class="page-sub">Search, retrieve and cross-reference aerodrome standards and technical guidance.</div>';
+
+      // hero search
+      h += '<div class="glass card" style="margin-bottom:22px;">'
+         + '<div style="position:relative;">'
+         + '<input id="heroSearch" type="text" placeholder="Search ICAO Annex 14, Doc 9157, provisions, technical specifications…" '
+         + 'style="height:48px;border-radius:999px;padding:0 18px;font-size:15px;">'
+         + '</div>'
+         + '<div class="pill-row" style="margin-top:14px;">'
+         + BOOT.quickAccess.slice(0, 10).map(function (q) { return '<span class="chip" data-qa="' + esc(q) + '">' + esc(q) + '</span>'; }).join('')
+         + '</div></div>';
+
+      // stats
+      h += '<div class="section-title">Library Statistics</div>';
+      h += '<div class="grid cols-4">'
+         + stat('▤', stats.totalDocuments, 'Documents in catalogue')
+         + stat('✓', stats.indexedDocuments, 'Indexed documents')
+         + stat('▦', stats.totalIndexedPages, 'Indexed pages')
+         + stat('◆', stats.totalSections, 'Searchable sections')
+         + stat('🔍', stats.totalSearchChunks, 'Search index entries')
+         + stat('★', stats.totalBookmarks, 'Bookmarks')
+         + stat('◷', stats.lastIndexDate || '—', 'Last indexing')
+         + stat('⚠', stats.indexingErrors, 'Indexing errors')
+         + '</div>';
+
+      // document library preview
+      h += '<div class="section-title" style="display:flex;justify-content:space-between;"><span>Document Library</span>'
+         + '<span class="chip" data-route="library">View all →</span></div>';
+      h += '<div class="grid auto">' + docs.slice(0, 6).map(docCard).join('') + '</div>';
+
+      // recent + frequent
+      h += '<div class="grid cols-2" style="margin-top:8px;">';
+      h += '<div><div class="section-title">Recently Accessed</div>' + recentList(recent) + '</div>';
+      h += '<div><div class="section-title">Frequently Used References</div>' + freqList(freq) + '</div>';
+      h += '</div>';
+
+      h += disclaimerBox();
+      $('#view').innerHTML = h;
+      wireDashboard();
+    }).catch(function (e) { $('#view').innerHTML = errorBox(e.message); });
+  }
+
+  function stat(ic, v, l) {
+    return '<div class="glass stat"><div class="ic">' + ic + '</div><div class="v">' + esc(v) + '</div><div class="l">' + esc(l) + '</div></div>';
+  }
+  function recentList(recent) {
+    if (!recent || !recent.length) return '<div class="glass card muted" style="font-size:13px;">No recent activity yet.</div>';
+    return '<div class="glass card">' + recent.slice(0, 8).map(function (r) {
+      return '<div class="toc-item" data-section="' + esc(r.id) + '">◷ ' + esc(r.label || r.id) + '</div>';
+    }).join('') + '</div>';
+  }
+  function freqList(freq) {
+    if (!freq || !freq.length) return '<div class="glass card muted" style="font-size:13px;">Usage tracking disabled or no data yet. Administrators can enable it in Settings.</div>';
+    return '<div class="glass card">' + freq.map(function (r) {
+      return '<div class="toc-item" data-section="' + esc(r.id) + '">★ ' + esc(r.label || r.id) + ' <span class="muted">(' + r.count + ')</span></div>';
+    }).join('') + '</div>';
+  }
+  function wireDashboard() {
+    var hero = $('#heroSearch');
+    if (hero) hero.addEventListener('keydown', function (e) { if (e.key === 'Enter' && hero.value.trim()) go('search?q=' + encodeURIComponent(hero.value.trim())); });
+    bindData('[data-qa]', 'data-qa', function (v) { go('search?q=' + encodeURIComponent(v)); });
+    bindData('[data-route]', 'data-route', function (v) { go(v); });
+    bindData('[data-section]', 'data-section', function (v) { go('section/' + encodeURIComponent(v)); });
+    bindDocCards();
+  }
+  function bindData(sel, attr, fn) {
+    Array.prototype.forEach.call(document.querySelectorAll(sel), function (el) {
+      if (el.__bound) return; el.__bound = true;
+      el.addEventListener('click', function (e) { e.stopPropagation(); fn(el.getAttribute(attr)); });
+    });
+  }
+
+  /* ---- document card ------------------------------------------------------ */
+  function docCard(d) {
+    var statusBadge = '<span class="badge status">' + esc(d.indexingStatus) + '</span>';
+    var vp = [d.volume, d.part].filter(Boolean).join(' · ');
+    return '<div class="glass doc-card">'
+      + '<div class="top"><span class="num">' + esc(d.number) + '</span>' + statusBadge + '</div>'
+      + '<div class="title">' + esc(d.title) + '</div>'
+      + '<div class="meta">' + (vp ? '<span>' + esc(vp) + '</span>' : '') + (d.edition ? '<span>' + esc(d.edition) + '</span>' : '') + '</div>'
+      + '<div class="meta"><span>' + (d.sections || 0) + ' sections</span><span>' + (d.indexedPages || 0) + '/' + (d.totalPages || 0) + ' pages</span>'
+      + '<span class="badge status">' + esc(d.status) + '</span></div>'
+      + '<div class="actions">'
+      + '<button class="btn sm" data-browse="' + d.documentId + '">Browse</button>'
+      + '<button class="btn sm ghost" data-search-in="' + d.documentId + '">Search within</button>'
+      + '</div></div>';
+  }
+  function bindDocCards() {
+    bindData('[data-browse]', 'data-browse', function (v) { go('doc/' + v); });
+    bindData('[data-search-in]', 'data-search-in', function (v) { go('search?doc=' + v); });
+  }
+
+  /* ---- Global Search ------------------------------------------------------ */
+  function viewSearch(r) {
+    var q = r.query.q || '';
+    var docFilter = r.query.doc || '';
+    var h = '';
+    h += '<div class="page-title">Global Search</div>';
+    h += '<div class="page-sub">Searches every indexed document simultaneously. Use "quotes" for phrases, AND / OR / NOT, or a paragraph number such as 3.4.1.</div>';
+    h += '<div class="glass filters" id="filterPanel"></div>';
+    h += '<div id="searchMeta" class="page-sub" style="margin:0 0 10px;"></div>';
+    h += '<div id="searchResults"></div>';
+    $('#view').innerHTML = h;
+    renderFilters(docFilter);
+    if (q || docFilter) { $('#globalSearch').value = q; runSearch(1); }
+    else { $('#searchResults').innerHTML = '<div class="empty"><div class="big">🔍</div><div>Enter a search term above to begin.</div></div>'; }
+  }
+
+  var SEARCH_STATE = { query: '', filters: {}, sort: 'relevance', page: 1 };
+
+  function renderFilters(docFilter) {
+    api('docs.list', {}).then(function (docs) {
+      var docOpts = '<option value="">All documents</option>' + docs.map(function (d) {
+        return '<option value="' + d.documentId + '"' + (d.documentId === docFilter ? ' selected' : '') + '>' + esc(d.number + ' ' + (d.volume || d.part || '')) + '</option>';
+      }).join('');
+      var typeOpts = '<option value="">Any type</option>' + BOOT.provisionTypes.map(function (t) { return '<option>' + esc(t) + '</option>'; }).join('');
+      var html = '<div class="row">'
+        + field('Document', '<select id="f-doc">' + docOpts + '</select>')
+        + field('Provision type', '<select id="f-type">' + typeOpts + '</select>')
+        + field('Chapter contains', '<input type="text" id="f-chapter" placeholder="e.g. Chapter 3">')
+        + field('Page from', '<input type="number" id="f-pageFrom" min="1">')
+        + field('Page to', '<input type="number" id="f-pageTo" min="1">')
+        + field('Sort by', '<select id="f-sort"><option value="relevance">Relevance</option><option value="document">Document</option><option value="section">Section</option><option value="page">Page</option></select>')
+        + '</div>'
+        + '<div style="margin-top:12px;display:flex;gap:10px;"><button class="btn primary sm" id="applyFilters">Apply</button>'
+        + '<button class="btn ghost sm" id="clearFilters">Clear</button>'
+        + '<label class="field" style="flex-direction:row;align-items:center;gap:6px;margin-left:8px;"><input type="checkbox" id="f-current" style="width:auto;"> Current editions only</label></div>';
+      $('#filterPanel').innerHTML = html;
+      if (docFilter) $('#f-doc').value = docFilter;
+      $('#applyFilters').addEventListener('click', function () { SEARCH_STATE.query = $('#globalSearch').value.trim(); runSearch(1); });
+      $('#clearFilters').addEventListener('click', function () {
+        ['f-doc','f-type','f-chapter','f-pageFrom','f-pageTo'].forEach(function (id) { $('#' + id).value = ''; });
+        $('#f-current').checked = false; runSearch(1);
+      });
+    });
+  }
+  function field(label, inner) { return '<label class="field">' + esc(label) + inner + '</label>'; }
+
+  function collectFilters() {
+    function v(id) { var el = $('#' + id); return el ? el.value.trim() : ''; }
+    var f = {};
+    if (v('f-doc')) f.documentId = v('f-doc');
+    if (v('f-type')) f.provisionType = v('f-type');
+    if (v('f-chapter')) f.chapter = v('f-chapter');
+    if (v('f-pageFrom')) f.pageFrom = v('f-pageFrom');
+    if (v('f-pageTo')) f.pageTo = v('f-pageTo');
+    if ($('#f-current') && $('#f-current').checked) f.statusCurrentOnly = true;
+    return f;
+  }
+
+  function runSearch(page) {
+    SEARCH_STATE.query = $('#globalSearch').value.trim() || SEARCH_STATE.query;
+    SEARCH_STATE.filters = collectFilters();
+    SEARCH_STATE.sort = ($('#f-sort') && $('#f-sort').value) || 'relevance';
+    SEARCH_STATE.page = page || 1;
+    var results = $('#searchResults');
+    if (results) loading(results);
+    api('search.run', { query: SEARCH_STATE.query, filters: SEARCH_STATE.filters, sort: SEARCH_STATE.sort, page: SEARCH_STATE.page })
+      .then(renderSearchResults)
+      .catch(function (e) { if (results) results.innerHTML = errorBox(e.message); });
+  }
+
+  function renderSearchResults(res) {
+    App.lastSearch = res;
+    var meta = $('#searchMeta');
+    if (meta) meta.innerHTML = res.total ? ('<b>' + res.total + '</b> result' + (res.total === 1 ? '' : 's') + ' · ' + res.took + ' ms') : '';
+    var box = $('#searchResults');
+    if (!res.total) {
+      box.innerHTML = '<div class="empty"><div class="big">∅</div><div>No results found' + (res.message ? '. ' + esc(res.message) : '.') + '</div>'
+        + '<div class="muted" style="margin-top:8px;font-size:13px;">Only indexed documents are searchable. Try different terms, or check indexing status in the Library.</div></div>';
+      return;
+    }
+    var h = res.results.map(resultCard).join('');
+    var pages = Math.ceil(res.total / res.pageSize);
+    if (pages > 1) {
+      h += '<div class="pager">'
+        + '<button class="btn sm ghost" ' + (res.page <= 1 ? 'disabled' : '') + ' id="prevPage">← Prev</button>'
+        + '<span class="muted">Page ' + res.page + ' of ' + pages + '</span>'
+        + '<button class="btn sm ghost" ' + (res.page >= pages ? 'disabled' : '') + ' id="nextPage">Next →</button></div>';
+    }
+    box.innerHTML = h;
+    bindData('.result', 'data-section', function (v) { go('section/' + encodeURIComponent(v)); });
+    if ($('#prevPage')) $('#prevPage').addEventListener('click', function () { runSearch(res.page - 1); });
+    if ($('#nextPage')) $('#nextPage').addEventListener('click', function () { runSearch(res.page + 1); });
+    bindResultActions();
+  }
+
+  function resultCard(r) {
+    var ref = [r.chapter, r.paragraph ? ('¶ ' + r.paragraph) : '', r.page ? ('p.' + r.page) : ''].filter(Boolean).join(' · ');
+    var ocr = r.ocr && r.ocr.indexOf('OCR') !== -1 ? '<span class="badge status" title="OCR-derived — verify">OCR</span>' : '';
+    return '<div class="glass result" data-section="' + esc(r.sectionId) + '">'
+      + '<div class="r-top"><span class="r-doc">' + esc(r.documentNumber) + (r.volume || r.part ? ' · ' + esc(r.volume || r.part) : '') + '</span>'
+      + provisionBadge(r.provisionType) + ocr + '<span class="r-ref">' + esc(ref) + '</span></div>'
+      + '<div class="r-head">' + esc(r.heading || r.paragraph || 'Provision') + '</div>'
+      + '<div class="r-snip">' + (r.snippet || '') + '</div>'
+      + '<div class="r-foot"><span>' + esc(r.documentTitle) + '</span>'
+      + '<span class="sp">'
+      + '<button class="btn sm ghost" data-bookmark="' + esc(r.sectionId) + '" title="Bookmark">★</button>'
+      + '<button class="btn sm ghost" data-cite="' + esc(r.sectionId) + '" title="Copy reference">⧉</button>'
+      + '<button class="btn sm" data-open="' + esc(r.sectionId) + '">Open</button>'
+      + '</span></div></div>';
+  }
+  function bindResultActions() {
+    bindData('[data-open]', 'data-open', function (v) { go('section/' + encodeURIComponent(v)); });
+    bindData('[data-bookmark]', 'data-bookmark', function (v) { quickBookmark(v); });
+    bindData('[data-cite]', 'data-cite', function (v) { copyCitation(v); });
+  }
+
+  /* ---- Library ------------------------------------------------------------ */
+  function viewLibrary() {
+    loading();
+    api('docs.list', { includeArchived: true }).then(function (docs) {
+      var byNumber = {};
+      docs.forEach(function (d) { (byNumber[d.number] = byNumber[d.number] || []).push(d); });
+      var h = '<div class="page-title">Document Library</div><div class="page-sub">Primary reference library. Browse or search within any document.</div>';
+      Object.keys(byNumber).sort().forEach(function (num) {
+        h += '<div class="section-title">' + esc(num) + '</div>';
+        h += '<div class="grid auto">' + byNumber[num].map(docCard).join('') + '</div>';
+      });
+      h += disclaimerBox();
+      $('#view').innerHTML = h;
+      bindDocCards();
+    }).catch(function (e) { $('#view').innerHTML = errorBox(e.message); });
+  }
+
+  /* ---- Document viewer ---------------------------------------------------- */
+  function viewDocument(r) {
+    var id = r.parts[1];
+    loading();
+    Promise.all([api('docs.get', { documentId: id }), api('docs.sections', { documentId: id })]).then(function (res) {
+      var d = res[0], secs = res[1];
+      var h = '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">'
+        + '<div><div class="page-title">' + esc(d.title) + '</div>'
+        + '<div class="page-sub">' + esc([d.number, d.volume, d.part, d.edition].filter(Boolean).join(' · ')) + '</div></div>'
+        + '<div style="display:flex;gap:8px;">'
+        + (d.hasFile ? '<button class="btn" id="openDrive">Open in Drive ↗</button>' : '')
+        + '<button class="btn" data-search-in="' + d.documentId + '">Search within</button></div></div>';
+
+      h += '<div class="notice" style="margin-bottom:16px;">Indexing: <b>' + esc(d.indexingStatus) + '</b> · ' + (d.indexedPages || 0) + '/' + (d.totalPages || 0) + ' pages · ' + (secs.length) + ' sections.'
+        + (d.indexingStatus !== 'Complete' ? ' Some content may not yet be searchable.' : '') + '</div>';
+
+      h += '<div class="viewer-grid">';
+      h += '<div class="glass toc"><div style="font-weight:650;margin-bottom:8px;">Contents</div>';
+      if (!secs.length) { h += '<div class="muted" style="font-size:12.5px;">Not yet indexed. An administrator can run indexing from Administration.</div>'; }
+      else {
+        var lastChapter = '';
+        secs.forEach(function (s) {
+          if (s.chapter && s.chapter !== lastChapter) { lastChapter = s.chapter; h += '<div style="font-weight:600;font-size:11.5px;margin:10px 0 2px;color:var(--text-faint);">' + esc(s.chapter) + '</div>'; }
+          h += '<div class="toc-item" data-section="' + esc(s.sectionId) + '">' + (s.paragraph ? '<b>' + esc(s.paragraph) + '</b> ' : '') + esc(s.heading || '(section)') + '</div>';
+        });
+      }
+      h += '</div>';
+
+      // viewer pane: embed PDF if available
+      h += '<div class="glass" style="padding:10px;">';
+      if (d.hasFile) {
+        h += '<iframe class="pdf-frame" src="https://drive.google.com/file/d/' + esc(d.driveFileId) + '/preview" allow="autoplay"></iframe>'
+          + '<div class="muted" style="font-size:11.5px;margin-top:8px;padding:0 4px;">If the embedded viewer is blocked by Drive permissions, use “Open in Drive”. Direct paragraph highlighting inside the PDF is not supported; use the Contents list and section view for precise navigation.</div>';
+      } else {
+        h += '<div class="empty"><div class="big">▤</div><div>No PDF linked to this document yet.</div>'
+          + (BOOT.isEditor ? '<div class="muted" style="margin-top:8px;">Link a Drive file in Administration → Documents.</div>' : '') + '</div>';
+      }
+      h += '</div></div>';
+
+      $('#view').innerHTML = h;
+      bindData('[data-section]', 'data-section', function (v) { go('section/' + encodeURIComponent(v)); });
+      bindData('[data-search-in]', 'data-search-in', function (v) { go('search?doc=' + v); });
+      if ($('#openDrive')) $('#openDrive').addEventListener('click', function () { window.open('https://drive.google.com/file/d/' + d.driveFileId + '/view', '_blank'); });
+    }).catch(function (e) { $('#view').innerHTML = errorBox(e.message); });
+  }
+
+  /* ---- Section detail ----------------------------------------------------- */
+  function viewSection(r) {
+    var id = r.parts[1];
+    loading();
+    api('docs.section', { sectionId: id }).then(function (s) {
+      var xr = s.crossReferences || { direct: [], related: [], suggested: [], empty: true };
+      var ocrNote = s.ocr && s.ocr.indexOf('OCR') !== -1
+        ? '<div class="notice" style="margin-bottom:14px;border-left-color:var(--t-recommended);background:color-mix(in srgb,var(--t-recommended) 12%,transparent);">⚠ This text is OCR-derived and has not been verified. Confirm wording against the original PDF.</div>' : '';
+      var h = '<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">'
+        + '<button class="btn sm ghost" onclick="history.back()">← Back</button>'
+        + (s.prev ? '<button class="btn sm ghost" data-section="' + esc(s.prev.sectionId) + '">↑ Previous</button>' : '')
+        + (s.next ? '<button class="btn sm ghost" data-section="' + esc(s.next.sectionId) + '">Next ↓</button>' : '')
+        + '</div>';
+
+      h += '<div class="viewer-grid">';
+      // main
+      h += '<div style="order:2;" class="glass card">';
+      h += '<div class="r-top" style="margin-bottom:10px;"><span class="r-doc">' + esc(s.documentNumber) + (s.volume || s.part ? ' · ' + esc(s.volume || s.part) : '') + '</span>' + provisionBadge(s.provisionType) + '</div>';
+      h += '<div class="page-title" style="font-size:20px;">' + (s.paragraph ? '<span style="color:var(--accent);">' + esc(s.paragraph) + '</span> ' : '') + esc(s.heading || 'Provision') + '</div>';
+      h += '<div class="page-sub">' + esc([s.chapter, s.edition, s.startPage ? 'PDF page ' + s.startPage : ''].filter(Boolean).join(' · ')) + '</div>';
+      h += ocrNote;
+      h += '<div class="detail-text">' + esc(s.text) + '</div>';
+      h += '<div class="glass" style="margin-top:16px;padding:12px 14px;font-size:12.5px;"><b>Citation</b><br>' + esc(s.citation) + '</div>';
+      h += '<div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap;">'
+        + '<button class="btn sm" data-bookmark="' + esc(s.sectionId) + '">★ Bookmark</button>'
+        + '<button class="btn sm ghost" data-cite="' + esc(s.sectionId) + '">⧉ Copy citation</button>'
+        + '<button class="btn sm ghost" id="noteBtn">✎ Add note</button>'
+        + (s.driveFileId ? '<button class="btn sm ghost" id="openPdf">Open PDF ↗</button>' : '')
+        + '<button class="btn sm ghost" id="printBtn">⤓ Print / export</button>'
+        + (BOOT.isEditor ? '<button class="btn sm ghost" id="toCompliance">+ Compliance register</button>' : '')
+        + '</div>';
+      h += '<div id="notesArea" style="margin-top:14px;"></div>';
+      h += '</div>';
+
+      // side: cross references + related subjects
+      h += '<div style="order:1;" class="glass card">';
+      h += '<div style="font-weight:650;margin-bottom:8px;">Cross-references</div>';
+      h += xrefGroup('Direct references', xr.direct, 'direct');
+      h += xrefGroup('Related provisions', xr.related, 'related');
+      h += xrefGroup('Suggested (algorithmic)', xr.suggested, 'suggested');
+      if (xr.empty) h += '<div class="muted" style="font-size:12.5px;">No related reference identified.</div>';
+      if (s.subject) h += '<div style="margin-top:14px;"><div style="font-weight:650;margin-bottom:6px;">Related topic</div><span class="chip" data-subject="' + esc(s.subject) + '">◆ ' + esc(s.subject) + '</span></div>';
+      h += '</div>';
+
+      h += '</div>';
+      $('#view').innerHTML = h;
+
+      bindData('[data-section]', 'data-section', function (v) { go('section/' + encodeURIComponent(v)); });
+      bindData('[data-xref]', 'data-xref', function (v) { if (v) go('section/' + encodeURIComponent(v)); });
+      bindData('[data-subject]', 'data-subject', function (v) { go('subject/' + encodeURIComponent(v)); });
+      bindData('[data-bookmark]', 'data-bookmark', function (v) { quickBookmark(v); });
+      bindData('[data-cite]', 'data-cite', function (v) { copyCitation(v); });
+      if ($('#openPdf')) $('#openPdf').addEventListener('click', function () { window.open('https://drive.google.com/file/d/' + s.driveFileId + '/view', '_blank'); });
+      if ($('#noteBtn')) $('#noteBtn').addEventListener('click', function () { openNoteModal(s); });
+      if ($('#printBtn')) $('#printBtn').addEventListener('click', function () { printSection(s.sectionId); });
+      if ($('#toCompliance')) $('#toCompliance').addEventListener('click', function () { openComplianceModal(s.sectionId); });
+      loadNotes(s.sectionId);
+    }).catch(function (e) { $('#view').innerHTML = errorBox(e.message); });
+  }
+
+  function xrefGroup(title, list, cls) {
+    if (!list || !list.length) return '';
+    return '<div style="margin-bottom:10px;"><div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:5px;">' + esc(title) + '</div>'
+      + list.map(function (x) {
+        return '<div class="xref-item ' + cls + '" data-xref="' + esc(x.targetSectionId || '') + '">'
+          + '<div class="tt">' + esc(x.type) + (x.verification ? ' · ' + esc(x.verification) : '') + '</div>'
+          + esc(x.targetDocumentTitle || x.label || 'Reference')
+          + (x.targetParagraph ? ' ¶ ' + esc(x.targetParagraph) : '') + '</div>';
+      }).join('') + '</div>';
+  }
+
+  function loadNotes(sectionId) {
+    api('notes.list', { sectionId: sectionId }).then(function (notes) {
+      if (!notes.length) { $('#notesArea').innerHTML = ''; return; }
+      $('#notesArea').innerHTML = '<div style="font-weight:650;margin-bottom:8px;">Your notes</div>' + notes.map(function (n) {
+        return '<div class="glass" style="padding:10px 12px;margin-bottom:8px;font-size:13px;">' + esc(n.text)
+          + (n.tags.length ? '<div class="pill-row" style="margin-top:6px;">' + n.tags.map(function (t) { return '<span class="badge status">' + esc(t) + '</span>'; }).join('') + '</div>' : '')
+          + '<div style="margin-top:6px;"><button class="btn sm ghost" data-delnote="' + n.noteId + '">Delete</button></div></div>';
+      }).join('');
+      bindData('[data-delnote]', 'data-delnote', function (v) { api('notes.remove', { noteId: v }).then(function () { toast('Note deleted', 'ok'); loadNotes(sectionId); }); });
+    });
+  }
+  function openNoteModal(s) {
+    openModal('<h2>Add note</h2><p class="muted" style="font-size:13px;">Private to you. Stored separately from the ICAO source text.</p>'
+      + '<label class="field" style="margin-top:12px;">Note<textarea id="noteText"></textarea></label>'
+      + '<label class="field" style="margin-top:10px;">Tags (comma separated)<input type="text" id="noteTags" placeholder="runway, inspection"></label>'
+      + '<div class="foot"><button class="btn ghost" onclick="window.__closeModal()">Cancel</button><button class="btn primary" id="saveNote">Save note</button></div>');
+    $('#saveNote').addEventListener('click', function () {
+      var text = $('#noteText').value.trim(); if (!text) { toast('Enter note text', 'err'); return; }
+      api('notes.save', { sectionId: s.sectionId, documentId: s.documentId, text: text, tags: $('#noteTags').value.split(',').map(function (t) { return t.trim(); }).filter(Boolean) })
+        .then(function () { window.__closeModal(); toast('Note saved', 'ok'); loadNotes(s.sectionId); })
+        .catch(function (e) { toast(e.message, 'err'); });
+    });
+  }
+
+  /* ---- Knowledge Library -------------------------------------------------- */
+  function viewKnowledge() {
+    loading();
+    api('knowledge.tree').then(function (tree) {
+      var h = '<div class="page-title">Technical Knowledge Library</div>'
+        + '<div class="page-sub">Aerodrome subjects grouped across documents. Counts reflect indexed content only.</div>';
+      tree.forEach(function (g) {
+        h += '<div class="section-title">' + esc(g.group) + '</div><div class="grid cols-3">';
+        g.subjects.forEach(function (s) {
+          var dim = s.count === 0 ? 'opacity:.55;' : '';
+          h += '<div class="glass doc-card" style="' + dim + 'cursor:pointer;" data-subject="' + esc(s.name) + '">'
+            + '<div class="title">◆ ' + esc(s.name) + '</div>'
+            + '<div class="meta"><span>' + s.count + ' indexed section' + (s.count === 1 ? '' : 's') + '</span></div></div>';
+        });
+        h += '</div>';
+      });
+      $('#view').innerHTML = h;
+      bindData('[data-subject]', 'data-subject', function (v) { go('subject/' + encodeURIComponent(v)); });
+    }).catch(function (e) { $('#view').innerHTML = errorBox(e.message); });
+  }
+
+  function viewSubject(r) {
+    var name = decodeURIComponent(r.parts[1] || '');
+    loading();
+    api('knowledge.subject', { name: name }).then(function (s) {
+      var h = '<button class="btn sm ghost" onclick="history.back()">← Back</button>';
+      h += '<div class="page-title" style="margin-top:10px;">' + esc(s.name) + '</div>';
+      h += '<div class="page-sub">' + esc(s.group) + ' · ' + s.totalMatches + ' related section(s) across the indexed library.</div>';
+      if (s.empty) { h += '<div class="empty"><div class="big">◆</div><div>No indexed content matches this subject yet.</div></div>'; $('#view').innerHTML = h; return; }
+
+      if (s.definitions && s.definitions.length) {
+        h += '<div class="section-title">Applicable definitions</div><div class="glass card">';
+        s.definitions.forEach(function (d) { h += '<div style="margin-bottom:8px;"><b>' + esc(d.term) + '.</b> ' + esc(d.definition) + '</div>'; });
+        h += '</div>';
+      }
+      s.documents.forEach(function (doc) {
+        h += '<div class="section-title">' + esc(doc.documentTitle) + '</div>';
+        h += '<div>' + doc.items.map(function (it) {
+          return '<div class="glass result" data-section="' + esc(it.sectionId) + '">'
+            + '<div class="r-top">' + provisionBadge(it.provisionType) + '<span class="r-ref">' + (it.paragraph ? '¶ ' + esc(it.paragraph) + ' · ' : '') + (it.page ? 'p.' + esc(it.page) : '') + '</span></div>'
+            + '<div class="r-head">' + esc(it.heading || 'Provision') + '</div>'
+            + '<div class="r-snip">' + esc(it.snippet) + '</div></div>';
+        }).join('') + '</div>';
+      });
+      $('#view').innerHTML = h;
+      bindData('.result', 'data-section', function (v) { go('section/' + encodeURIComponent(v)); });
+    }).catch(function (e) { $('#view').innerHTML = errorBox(e.message); });
+  }
+
+  /* ---- Ask ICAO Reference ------------------------------------------------- */
+  function viewAsk() {
+    var h = '<div class="page-title">Ask ICAO Reference</div>'
+      + '<div class="page-sub">A source-based assistant. It retrieves the most relevant indexed passages and cites them — it does not generate requirements or substitute external knowledge.</div>'
+      + '<div class="glass card"><div style="display:flex;gap:10px;">'
+      + '<input type="text" id="askInput" placeholder="e.g. What are the requirements for runway strip width?" style="height:46px;">'
+      + '<button class="btn primary" id="askBtn">Ask</button></div>'
+      + '<div class="pill-row" style="margin-top:12px;">'
+      + ['What are the requirements for a runway strip?', 'Guidance for taxiway shoulder design?', 'How are rescue and firefighting categories determined?', 'What does Annex 14 state about RESA?']
+          .map(function (q) { return '<span class="chip" data-ask="' + esc(q) + '">' + esc(q) + '</span>'; }).join('')
+      + '</div></div><div id="askResult" style="margin-top:16px;"></div>';
+    $('#view').innerHTML = h;
+    $('#askBtn').addEventListener('click', function () { doAsk($('#askInput').value.trim()); });
+    $('#askInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') doAsk($('#askInput').value.trim()); });
+    bindData('[data-ask]', 'data-ask', function (v) { $('#askInput').value = v; doAsk(v); });
+  }
+  function doAsk(q) {
+    if (!q) return;
+    loading($('#askResult'));
+    api('ask.query', { question: q }).then(function (res) {
+      if (!res.answered) { $('#askResult').innerHTML = '<div class="notice">' + esc(res.message) + '</div>'; return; }
+      var h = '<div class="glass card"><div style="font-weight:650;margin-bottom:6px;">Overview <span class="badge status">assembled from retrieved passages</span></div>'
+        + '<div style="font-size:13.5px;color:var(--text-soft);">' + esc(res.overview) + '</div></div>';
+      h += '<div class="section-title">Source passages</div>';
+      h += res.passages.map(function (p) {
+        return '<div class="glass result" data-section="' + esc(p.sectionId) + '">'
+          + '<div class="r-top"><span class="r-doc">' + esc(p.documentTitle) + '</span>' + provisionBadge(p.provisionType)
+          + (p.ocr && p.ocr.indexOf('OCR') !== -1 ? '<span class="badge status">OCR</span>' : '') + '</div>'
+          + '<div class="r-head">' + esc(p.heading || p.paragraph || 'Passage') + '</div>'
+          + '<div class="r-snip">' + esc(p.excerpt) + '</div>'
+          + '<div class="r-foot"><span>' + esc(p.citation) + '</span></div></div>';
+      }).join('');
+      h += '<div class="notice" style="margin-top:14px;">' + esc(res.disclaimer) + '</div>';
+      $('#askResult').innerHTML = h;
+      bindData('.result', 'data-section', function (v) { go('section/' + encodeURIComponent(v)); });
+    }).catch(function (e) { $('#askResult').innerHTML = errorBox(e.message); });
+  }
+
+  /* ---- Glossary ----------------------------------------------------------- */
+  function viewGlossary() {
+    var h = '<div class="page-title">Technical Glossary</div>'
+      + '<div class="page-sub">Definitions harvested from indexed documents. Verbatim source definitions are marked.</div>'
+      + '<div class="glass card" style="margin-bottom:16px;"><input type="text" id="glossSearch" placeholder="Search terms or definitions…"></div>'
+      + '<div id="glossList"></div>';
+    $('#view').innerHTML = h;
+    var run = debounce(function () {
+      api('glossary.search', { query: $('#glossSearch').value.trim() }).then(function (rows) {
+        if (!rows.length) { $('#glossList').innerHTML = '<div class="empty"><div class="big">Aa</div><div>No glossary terms indexed yet.</div></div>'; return; }
+        $('#glossList').innerHTML = '<div class="glass card">' + rows.map(function (r) {
+          return '<div style="padding:9px 0;border-bottom:1px solid var(--line);"><b>' + esc(r.term) + '</b> '
+            + (r.isVerbatim ? '<span class="badge status">verbatim</span>' : '') + '<br><span style="font-size:13.5px;color:var(--text-soft);">' + esc(r.definition) + '</span>'
+            + (r.sectionId ? ' <a href="#/section/' + encodeURIComponent(r.sectionId) + '">source →</a>' : '') + '</div>';
+        }).join('') + '</div>';
+      });
+    }, 250);
+    $('#glossSearch').addEventListener('input', run);
+    run();
+  }
+
+  /* ---- Version comparison ------------------------------------------------- */
+  function viewVersions() {
+    loading();
+    api('version.sets').then(function (sets) {
+      var h = '<div class="page-title">Version Comparison</div>'
+        + '<div class="page-sub">Compare two indexed editions of the same document by paragraph number. Paragraph numbers are not assumed stable between editions.</div>';
+      if (!sets.length) { h += '<div class="empty"><div class="big">⇄</div><div>No document has two or more indexed editions available for comparison.</div></div>'; $('#view').innerHTML = h; return; }
+      sets.forEach(function (set, i) {
+        var opts = set.editions.map(function (e) { return '<option value="' + e.documentId + '">' + esc(e.edition || 'Edition') + ' (' + esc(e.indexed) + ')</option>'; }).join('');
+        h += '<div class="glass card" style="margin-bottom:14px;"><div style="font-weight:650;">' + esc(set.title) + '</div>'
+          + '<div class="row" style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin-top:10px;align-items:end;">'
+          + '<label class="field">Edition A<select id="va' + i + '">' + opts + '</select></label>'
+          + '<label class="field">Edition B<select id="vb' + i + '">' + opts + '</select></label>'
+          + '<button class="btn primary" data-compare="' + i + '">Compare</button></div>'
+          + '<div id="vres' + i + '" style="margin-top:12px;"></div></div>';
+      });
+      $('#view').innerHTML = h;
+      bindData('[data-compare]', 'data-compare', function (i) {
+        var a = $('#va' + i).value, b = $('#vb' + i).value;
+        if (a === b) { toast('Choose two different editions', 'err'); return; }
+        loading($('#vres' + i));
+        api('version.compare', { docIdA: a, docIdB: b }).then(function (res) { renderCompare($('#vres' + i), res); }).catch(function (e) { $('#vres' + i).innerHTML = errorBox(e.message); });
+      });
+    }).catch(function (e) { $('#view').innerHTML = errorBox(e.message); });
+  }
+  function renderCompare(box, res) {
+    var h = '<div class="notice">' + esc(res.summary) + '</div>';
+    if (res.modified.length) {
+      h += '<div class="section-title">Modified paragraphs</div>';
+      res.modified.slice(0, 40).forEach(function (m) {
+        h += '<div class="glass card" style="margin-bottom:8px;"><b>¶ ' + esc(m.paragraph) + '</b> ' + esc(m.heading) + ' <span class="badge status">' + m.similarity + '% similar</span>'
+          + '<div class="grid cols-2" style="margin-top:8px;"><div><div class="muted" style="font-size:11px;">' + esc(res.editionA.edition) + '</div><div style="font-size:12.5px;">' + esc(m.before) + '</div></div>'
+          + '<div><div class="muted" style="font-size:11px;">' + esc(res.editionB.edition) + '</div><div style="font-size:12.5px;">' + esc(m.after) + '</div></div></div></div>';
+      });
+    }
+    function listBlock(title, arr) {
+      if (!arr.length) return '';
+      return '<div class="section-title">' + title + ' (' + arr.length + ')</div><div class="glass card">' + arr.slice(0, 40).map(function (a) {
+        return '<div style="padding:6px 0;border-bottom:1px solid var(--line);"><b>¶ ' + esc(a.paragraph) + '</b> ' + esc(a.heading) + '</div>';
+      }).join('') + '</div>';
+    }
+    h += listBlock('Added in ' + esc(res.editionB.edition), res.added);
+    h += listBlock('Removed from ' + esc(res.editionA.edition), res.removed);
+    box.innerHTML = h;
+  }
+
+  /* ---- Recently viewed ---------------------------------------------------- */
+  function viewRecent() {
+    loading();
+    api('dashboard.recent').then(function (recent) {
+      var h = '<div class="page-title">Recently Viewed</div><div class="page-sub">Your recently accessed provisions and documents (private to you).</div>';
+      if (!recent.length) { h += '<div class="empty"><div class="big">◷</div><div>No recent activity yet.</div></div>'; }
+      else { h += '<div class="glass card">' + recent.map(function (r) { return '<div class="toc-item" data-section="' + esc(r.id) + '">◷ ' + esc(r.label || r.id) + '</div>'; }).join('') + '</div>'; }
+      $('#view').innerHTML = h;
+      bindData('[data-section]', 'data-section', function (v) { go('section/' + encodeURIComponent(v)); });
+    });
+  }
+
+  /* ---- Bookmarks ---------------------------------------------------------- */
+  function viewBookmarks() {
+    loading();
+    Promise.all([api('bookmarks.list'), api('bookmarks.collections')]).then(function (res) {
+      var bms = res[0], cols = res[1];
+      var h = '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;"><div><div class="page-title">Bookmarks &amp; Collections</div>'
+        + '<div class="page-sub">Your saved references, organised into collections.</div></div>'
+        + '<button class="btn" id="exportBm">⤓ Export CSV</button></div>';
+      h += '<div class="pill-row" style="margin-bottom:16px;">' + cols.map(function (c) {
+        return '<span class="chip" data-col="' + esc(c.name) + '">' + esc(c.name) + ' <span class="muted">' + c.count + '</span></span>';
+      }).join('') + '</div>';
+      if (!bms.length) { h += '<div class="empty"><div class="big">★</div><div>No bookmarks yet. Use the ★ button on any provision.</div></div>'; }
+      else {
+        h += '<div id="bmList">' + bms.map(bookmarkCard).join('') + '</div>';
+      }
+      $('#view').innerHTML = h;
+      bindData('.result', 'data-section', function (v) { go('section/' + encodeURIComponent(v)); });
+      bindData('[data-delbm]', 'data-delbm', function (v) { api('bookmarks.remove', { bookmarkId: v }).then(function () { toast('Removed', 'ok'); viewBookmarks(); }); });
+      bindData('[data-col]', 'data-col', function (v) {
+        Array.prototype.forEach.call(document.querySelectorAll('#bmList .result'), function (el) {
+          el.style.display = el.getAttribute('data-collection') === v ? '' : 'none';
+        });
+      });
+      if ($('#exportBm')) $('#exportBm').addEventListener('click', function () { api('export.bookmarksCsv').then(function (r) { downloadText(r.filename, r.csv); }); });
+    }).catch(function (e) { $('#view').innerHTML = errorBox(e.message); });
+  }
+  function bookmarkCard(b) {
+    return '<div class="glass result" data-section="' + esc(b.sectionId) + '" data-collection="' + esc(b.collection) + '">'
+      + '<div class="r-top"><span class="r-doc">' + esc(b.documentTitle) + '</span><span class="badge status">' + esc(b.collection) + '</span>'
+      + (b.paragraph ? '<span class="r-ref">¶ ' + esc(b.paragraph) + '</span>' : '') + '</div>'
+      + '<div class="r-head">' + esc(b.label || b.heading || 'Bookmark') + '</div>'
+      + '<div class="r-foot"><span class="muted">' + esc(b.dateCreated) + '</span><span class="sp"><button class="btn sm ghost" data-delbm="' + b.bookmarkId + '">Remove</button></span></div></div>';
+  }
+
+  /* ---- Compliance --------------------------------------------------------- */
+  function viewCompliance() {
+    if (!BOOT.isEditor) { $('#view').innerHTML = errorBox('Compliance mapping requires the Editor or Administrator role.'); return; }
+    loading();
+    Promise.all([api('compliance.summary'), api('compliance.list', { filters: {} })]).then(function (res) {
+      var sum = res[0], rows = res[1];
+      var h = '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;"><div><div class="page-title">Compliance Mapping</div>'
+        + '<div class="page-sub">Map ICAO provisions to national regulations and track status. Status is set by you — never inferred.</div></div>'
+        + '<div style="display:flex;gap:8px;"><button class="btn" id="addManual">+ Add entry</button><button class="btn" id="exportCmp">⤓ Export CSV</button></div></div>';
+      h += '<div class="grid cols-4" style="margin:4px 0 18px;">'
+        + stat('Σ', sum.total, 'Total mapped')
+        + stat('✓', sum['Compliant'] || 0, 'Compliant')
+        + stat('◑', sum['Partially Compliant'] || 0, 'Partially compliant')
+        + stat('✗', sum['Non-Compliant'] || 0, 'Non-compliant')
+        + stat('◷', sum['Under Review'] || 0, 'Under review')
+        + stat('⏰', sum.overdue || 0, 'Overdue actions') + '</div>';
+      h += complianceTable(rows);
+      $('#view').innerHTML = h;
+      bindData('[data-editcmp]', 'data-editcmp', function (v) { openComplianceEdit(v, rows); });
+      bindData('[data-delcmp]', 'data-delcmp', function (v) { confirmDialog('Delete this compliance record?', function () { api('compliance.remove', { referenceId: v }).then(function () { toast('Deleted', 'ok'); viewCompliance(); }); }); });
+      if ($('#addManual')) $('#addManual').addEventListener('click', function () { openComplianceModal(null); });
+      if ($('#exportCmp')) $('#exportCmp').addEventListener('click', function () { api('export.complianceCsv', { filters: {} }).then(function (r) { downloadText(r.filename, r.csv); }); });
+    }).catch(function (e) { $('#view').innerHTML = errorBox(e.message); });
+  }
+  function complianceTable(rows) {
+    if (!rows.length) return '<div class="empty"><div class="big">✓</div><div>No compliance records yet.</div></div>';
+    var h = '<div class="glass table-wrap"><table class="data"><thead><tr><th>Source</th><th>¶</th><th>Type</th><th>National reg.</th><th>Responsible</th><th>Status</th><th>Target</th><th></th></tr></thead><tbody>';
+    rows.forEach(function (r) {
+      h += '<tr><td>' + esc(r.documentTitle || '—') + '</td><td>' + esc(r.paragraph) + '</td><td>' + provisionBadge(r.provisionType) + '</td>'
+        + '<td>' + esc(r.nationalRegulation) + '</td><td>' + esc(r.responsibleUnit) + '</td>'
+        + '<td><span class="badge status">' + esc(r.complianceStatus) + '</span></td><td>' + esc(r.targetDate) + '</td>'
+        + '<td style="white-space:nowrap;"><button class="btn sm ghost" data-editcmp="' + r.referenceId + '">Edit</button> <button class="btn sm ghost" data-delcmp="' + r.referenceId + '">✕</button></td></tr>';
+    });
+    return h + '</tbody></table></div>';
+  }
+  function complianceForm(rec) {
+    rec = rec || {};
+    var statusOpts = BOOT.complianceStatuses.map(function (s) { return '<option' + (s === rec.complianceStatus ? ' selected' : '') + '>' + esc(s) + '</option>'; }).join('');
+    return '<div class="form-grid">'
+      + '<label class="field full">Requirement text / source excerpt<textarea id="c-req">' + esc(rec.requirementText || '') + '</textarea></label>'
+      + '<label class="field">Paragraph<input type="text" id="c-para" value="' + esc(rec.paragraph || '') + '"></label>'
+      + '<label class="field">Provision type<input type="text" id="c-type" value="' + esc(rec.provisionType || '') + '"></label>'
+      + '<label class="field">National regulation<input type="text" id="c-natreg" value="' + esc(rec.nationalRegulation || '') + '"></label>'
+      + '<label class="field">Aerodrome manual section<input type="text" id="c-manual" value="' + esc(rec.aerodromeManualSection || '') + '"></label>'
+      + '<label class="field">Responsible unit<input type="text" id="c-unit" value="' + esc(rec.responsibleUnit || '') + '"></label>'
+      + '<label class="field">Compliance status<select id="c-status">' + statusOpts + '</select></label>'
+      + '<label class="field">Evidence link<input type="text" id="c-evid" value="' + esc(rec.evidenceLink || '') + '"></label>'
+      + '<label class="field">Target date<input type="date" id="c-target" value="' + esc(rec.targetDate || '') + '"></label>'
+      + '<label class="field full">Identified gap<textarea id="c-gap">' + esc(rec.identifiedGap || '') + '</textarea></label>'
+      + '<label class="field full">Corrective action<textarea id="c-action">' + esc(rec.correctiveAction || '') + '</textarea></label>'
+      + '<label class="field full">Remarks<textarea id="c-remarks">' + esc(rec.remarks || '') + '</textarea></label>'
+      + '</div>';
+  }
+  function collectComplianceForm() {
+    function v(id) { return ($('#' + id) || {}).value || ''; }
+    return {
+      requirementText: v('c-req'), paragraph: v('c-para'), provisionType: v('c-type'),
+      nationalRegulation: v('c-natreg'), aerodromeManualSection: v('c-manual'), responsibleUnit: v('c-unit'),
+      complianceStatus: v('c-status'), evidenceLink: v('c-evid'), targetDate: v('c-target'),
+      identifiedGap: v('c-gap'), correctiveAction: v('c-action'), remarks: v('c-remarks')
+    };
+  }
+  function openComplianceModal(sectionId) {
+    openModal('<h2>' + (sectionId ? 'Add provision to compliance register' : 'New compliance entry') + '</h2>'
+      + '<p class="muted" style="font-size:13px;">ICAO provisions are kept distinct from national regulations and operator requirements.</p>'
+      + complianceForm({}) + '<div class="foot"><button class="btn ghost" onclick="window.__closeModal()">Cancel</button><button class="btn primary" id="saveCmp">Save</button></div>', true);
+    $('#saveCmp').addEventListener('click', function () {
+      var fields = collectComplianceForm();
+      var call = sectionId ? api('compliance.addFromSection', { sectionId: sectionId, fields: fields }) : api('compliance.addManual', { fields: fields });
+      call.then(function () { window.__closeModal(); toast('Compliance record saved', 'ok'); if (App.route.base === 'compliance') viewCompliance(); }).catch(function (e) { toast(e.message, 'err'); });
+    });
+  }
+  function openComplianceEdit(id, rows) {
+    var rec = rows.filter(function (r) { return r.referenceId === id; })[0] || {};
+    openModal('<h2>Edit compliance entry</h2>' + complianceForm(rec)
+      + '<div class="foot"><button class="btn ghost" onclick="window.__closeModal()">Cancel</button><button class="btn primary" id="updCmp">Update</button></div>', true);
+    $('#updCmp').addEventListener('click', function () {
+      api('compliance.update', { referenceId: id, fields: collectComplianceForm() }).then(function () { window.__closeModal(); toast('Updated', 'ok'); viewCompliance(); }).catch(function (e) { toast(e.message, 'err'); });
+    });
+  }
+
+  /* ---- Reports & Exports -------------------------------------------------- */
+  function viewReports() {
+    var h = '<div class="page-title">Reports &amp; Exports</div><div class="page-sub">Export references with full citations. Exports note that the original document is authoritative.</div>'
+      + '<div class="grid cols-2">'
+      + exportCard('★ Bookmarks (CSV)', 'Export all your bookmarks with citations.', 'exp-bm')
+      + exportCard('✓ Compliance register (CSV)', 'Export the full compliance register.', 'exp-cmp')
+      + '</div>';
+    h += '<div class="section-title">Latest search results</div>';
+    if (App.lastSearch && App.lastSearch.results && App.lastSearch.results.length) {
+      h += '<div class="glass card"><div class="muted" style="font-size:13px;margin-bottom:10px;">' + App.lastSearch.results.length + ' result(s) from your last search.</div>'
+        + '<button class="btn" id="expSearch">⤓ Export results (CSV)</button></div>';
+    } else { h += '<div class="glass card muted" style="font-size:13px;">Run a search first to export its results.</div>'; }
+    h += disclaimerBox();
+    $('#view').innerHTML = h;
+    $('#exp-bm').addEventListener('click', function () { api('export.bookmarksCsv').then(function (r) { downloadText(r.filename, r.csv); }); });
+    $('#exp-cmp').addEventListener('click', function () { api('export.complianceCsv', { filters: {} }).then(function (r) { downloadText(r.filename, r.csv); }).catch(function (e) { toast(e.message, 'err'); }); });
+    if ($('#expSearch')) $('#expSearch').addEventListener('click', function () {
+      var ids = App.lastSearch.results.map(function (r) { return r.sectionId; });
+      api('export.sectionsCsv', { sectionIds: ids }).then(function (r) { downloadText(r.filename, r.csv); });
+    });
+  }
+  function exportCard(title, sub, id) {
+    return '<div class="glass card"><div style="font-weight:650;">' + esc(title) + '</div><div class="muted" style="font-size:13px;margin:6px 0 12px;">' + esc(sub) + '</div><button class="btn primary sm" id="' + id + '">⤓ Export</button></div>';
+  }
+
+  /* ---- Settings ----------------------------------------------------------- */
+  function viewSettings() {
+    var theme = localStorage.getItem('theme') || 'system';
+    var h = '<div class="page-title">Settings</div><div class="page-sub">Preferences and account information.</div>';
+    h += '<div class="glass card" style="margin-bottom:14px;"><div style="font-weight:650;margin-bottom:10px;">Appearance</div>'
+      + '<label class="field" style="max-width:280px;">Theme<select id="themeSel">'
+      + ['system','light','dark'].map(function (t) { return '<option value="' + t + '"' + (theme === t ? ' selected' : '') + '>' + t[0].toUpperCase() + t.slice(1) + '</option>'; }).join('')
+      + '</select></label></div>';
+    h += '<div class="glass card" style="margin-bottom:14px;"><div style="font-weight:650;margin-bottom:10px;">Account</div>'
+      + kv('Name', BOOT.user ? BOOT.user.displayName : '—') + kv('Email', BOOT.user ? BOOT.user.email : '—') + kv('Role', BOOT.user ? BOOT.user.role : '—') + '</div>';
+    h += '<div class="glass card"><div style="font-weight:650;margin-bottom:10px;">Search history</div>'
+      + '<div id="histList" class="muted" style="font-size:13px;">Loading…</div>'
+      + '<button class="btn sm ghost" id="clearHist" style="margin-top:10px;">Clear history</button></div>';
+    h += disclaimerBox();
+    $('#view').innerHTML = h;
+    $('#themeSel').addEventListener('change', function () { applyTheme(this.value); });
+    api('search.history').then(function (hist) {
+      $('#histList').innerHTML = hist.length ? hist.map(function (x) { return '<div class="toc-item" data-q="' + esc(x.q) + '">🔍 ' + esc(x.q) + ' <span class="muted">(' + x.n + ')</span></div>'; }).join('') : 'No recent searches.';
+      bindData('[data-q]', 'data-q', function (v) { go('search?q=' + encodeURIComponent(v)); });
+    });
+    $('#clearHist').addEventListener('click', function () { api('search.clearHistory').then(function () { toast('History cleared', 'ok'); viewSettings(); }); });
+  }
+  function kv(k, v) { return '<div class="kv" style="margin-bottom:6px;"><b style="min-width:70px;display:inline-block;">' + esc(k) + '</b> ' + esc(v) + '</div>'; }
+
+  /* ---- Administration ----------------------------------------------------- */
+  function viewAdmin() {
+    if (!BOOT.isAdmin && !BOOT.isEditor) { $('#view').innerHTML = errorBox('Administration requires Editor or Administrator role.'); return; }
+    loading();
+    Promise.all([api('docs.list', { includeArchived: true }), api('admin.status').catch(function () { return null; })]).then(function (res) {
+      var docs = res[0], status = res[1];
+      var h = '<div class="page-title">Administration</div><div class="page-sub">Manage documents, indexing, users and system settings.</div>';
+      h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">'
+        + '<button class="btn" id="aAutoLink">Auto-link Drive PDFs</button>'
+        + '<button class="btn" id="aRegister">+ Register document</button>'
+        + (BOOT.isAdmin ? '<button class="btn" id="aTrigger">' + (status && status.indexingTrigger ? 'Disable' : 'Enable') + ' auto-indexing</button>' : '')
+        + (BOOT.isAdmin ? '<button class="btn" id="aUsers">Manage users</button><button class="btn" id="aAudit">Audit log</button>' : '')
+        + '</div>';
+
+      h += '<div class="section-title">Documents &amp; Indexing</div>';
+      h += '<div class="glass table-wrap"><table class="data"><thead><tr><th>Document</th><th>Edition</th><th>Status</th><th>Indexing</th><th>Pages</th><th>File</th><th>Actions</th></tr></thead><tbody>';
+      docs.forEach(function (d) {
+        h += '<tr><td><b>' + esc(d.number) + '</b> ' + esc(d.volume || d.part || '') + '<br><span class="muted" style="font-size:11.5px;">' + esc(d.title) + '</span></td>'
+          + '<td>' + esc(d.edition) + '</td><td><span class="badge status">' + esc(d.status) + '</span></td>'
+          + '<td><span class="badge status">' + esc(d.indexingStatus) + '</span><div id="prog-' + d.documentId + '"></div></td>'
+          + '<td>' + (d.indexedPages || 0) + '/' + (d.totalPages || 0) + '</td>'
+          + '<td>' + (d.hasFile ? '✓' : '<span class="muted">—</span>') + '</td>'
+          + '<td style="white-space:nowrap;">'
+          + '<button class="btn sm ghost" data-link="' + d.documentId + '">Link PDF</button> '
+          + '<button class="btn sm" data-index="' + d.documentId + '">' + (d.indexingStatus === 'Pending' ? 'Index' : 'Re-index') + '</button> '
+          + '<button class="btn sm ghost" data-editdoc="' + d.documentId + '">Edit</button>'
+          + (BOOT.isAdmin ? ' <button class="btn sm ghost" data-deldoc="' + d.documentId + '">✕</button>' : '')
+          + '</td></tr>';
+      });
+      h += '</tbody></table></div>';
+      h += '<div id="adminPanel" style="margin-top:18px;"></div>';
+      $('#view').innerHTML = h;
+      wireAdmin(docs, status);
+    }).catch(function (e) { $('#view').innerHTML = errorBox(e.message); });
+  }
+
+  function wireAdmin(docs, status) {
+    bindData('[data-index]', 'data-index', function (v) { startIndex(v); });
+    bindData('[data-link]', 'data-link', function (v) { openLinkModal(v); });
+    bindData('[data-editdoc]', 'data-editdoc', function (v) { openDocEdit(docs, v); });
+    bindData('[data-deldoc]', 'data-deldoc', function (v) { confirmDialog('Delete this document and all its indexed content? This cannot be undone.', function () { api('admin.removeDocument', { documentId: v }).then(function () { toast('Document deleted', 'ok'); viewAdmin(); }); }); });
+    if ($('#aAutoLink')) $('#aAutoLink').addEventListener('click', function () { api('admin.autoLink').then(function (linked) { toast(linked.length + ' file(s) linked', 'ok'); viewAdmin(); }).catch(function (e) { toast(e.message, 'err'); }); });
+    if ($('#aRegister')) $('#aRegister').addEventListener('click', function () { openDocEdit(null, null); });
+    if ($('#aTrigger')) $('#aTrigger').addEventListener('click', function () {
+      var on = status && status.indexingTrigger;
+      api(on ? 'admin.removeTrigger' : 'admin.installTrigger').then(function () { toast('Auto-indexing ' + (on ? 'disabled' : 'enabled'), 'ok'); viewAdmin(); });
+    });
+    if ($('#aUsers')) $('#aUsers').addEventListener('click', adminUsers);
+    if ($('#aAudit')) $('#aAudit').addEventListener('click', adminAudit);
+  }
+
+  function startIndex(docId) {
+    toast('Indexing started — converting & extracting text…', 'info');
+    var prog = $('#prog-' + docId);
+    if (prog) prog.innerHTML = '<div class="progress" style="margin-top:6px;"><span style="width:5%"></span></div>';
+    api('admin.startIndex', { documentId: docId }).then(function (p) { pollIndex(docId, p); }).catch(function (e) { toast('Indexing error: ' + e.message, 'err'); if (prog) prog.innerHTML = '<span class="muted">Failed</span>'; });
+  }
+  function pollIndex(docId, p) {
+    var prog = $('#prog-' + docId);
+    if (p && prog) {
+      var pct = p.totalSections ? Math.round((p.indexedSections / p.totalSections) * 100) : 0;
+      prog.innerHTML = '<div class="progress" style="margin-top:6px;"><span style="width:' + pct + '%"></span></div><span class="muted" style="font-size:11px;">' + (p.indexedSections || 0) + '/' + (p.totalSections || 0) + ' sections</span>';
+    }
+    if (p && p.status && p.status !== 'Processing') { toast('Indexing ' + p.status.toLowerCase() + (p.lowQuality ? ' — ' + p.lowQuality + ' low-quality section(s) flagged' : ''), p.status === 'Failed' ? 'err' : 'ok'); setTimeout(viewAdmin, 900); return; }
+    api('admin.runBatch', { documentId: docId }).then(function (np) { setTimeout(function () { pollIndex(docId, np); }, 400); }).catch(function (e) { toast(e.message, 'err'); });
+  }
+
+  function openLinkModal(docId) {
+    loading(document.createElement('div'));
+    api('admin.listDrivePdfs').then(function (pdfs) {
+      var opts = pdfs.map(function (p) { return '<option value="' + p.id + '">' + esc(p.name) + '</option>'; }).join('');
+      openModal('<h2>Link Drive PDF</h2><p class="muted" style="font-size:13px;">Select a PDF from the configured library folder.</p>'
+        + '<label class="field" style="margin-top:10px;">PDF file<select id="pdfSel">' + (opts || '<option value="">No PDFs found in library folder</option>') + '</select></label>'
+        + '<label class="field" style="margin-top:10px;">…or paste a Drive file id<input type="text" id="pdfId" placeholder="Drive file id"></label>'
+        + '<div class="foot"><button class="btn ghost" onclick="window.__closeModal()">Cancel</button><button class="btn primary" id="doLink">Link</button></div>');
+      $('#doLink').addEventListener('click', function () {
+        var id = ($('#pdfId').value.trim()) || ($('#pdfSel') ? $('#pdfSel').value : '');
+        if (!id) { toast('Choose a file', 'err'); return; }
+        api('admin.linkFile', { documentId: docId, driveFileId: id }).then(function () { window.__closeModal(); toast('PDF linked', 'ok'); viewAdmin(); }).catch(function (e) { toast(e.message, 'err'); });
+      });
+    }).catch(function (e) { toast(e.message, 'err'); });
+  }
+
+  function openDocEdit(docs, id) {
+    var d = id && docs ? docs.filter(function (x) { return x.documentId === id; })[0] : {};
+    d = d || {};
+    openModal('<h2>' + (id ? 'Edit document' : 'Register document') + '</h2><div class="form-grid">'
+      + '<label class="field full">Title<input type="text" id="d-title" value="' + esc(d.title || '') + '"></label>'
+      + '<label class="field">ICAO number<input type="text" id="d-number" value="' + esc(d.number || '') + '"></label>'
+      + '<label class="field">Category<input type="text" id="d-cat" value="' + esc(d.category || 'Manual') + '"></label>'
+      + '<label class="field">Volume<input type="text" id="d-vol" value="' + esc(d.volume || '') + '"></label>'
+      + '<label class="field">Part<input type="text" id="d-part" value="' + esc(d.part || '') + '"></label>'
+      + '<label class="field">Edition<input type="text" id="d-ed" value="' + esc(d.edition || '') + '"></label>'
+      + '<label class="field">Amendment<input type="text" id="d-am" value="' + esc(d.amendment || '') + '"></label>'
+      + '<label class="field full">Description<textarea id="d-desc">' + esc(d.description || '') + '</textarea></label>'
+      + '</div><div class="foot"><button class="btn ghost" onclick="window.__closeModal()">Cancel</button><button class="btn primary" id="saveDoc">Save</button></div>', true);
+    $('#saveDoc').addEventListener('click', function () {
+      var payload = { title: $('#d-title').value, number: $('#d-number').value, category: $('#d-cat').value, volume: $('#d-vol').value, part: $('#d-part').value, edition: $('#d-ed').value, amendment: $('#d-am').value, description: $('#d-desc').value };
+      var call = id ? api('admin.updateMeta', { documentId: id, fields: payload }) : api('admin.register', payload);
+      call.then(function () { window.__closeModal(); toast('Saved', 'ok'); viewAdmin(); }).catch(function (e) { toast(e.message, 'err'); });
+    });
+  }
+
+  function adminUsers() {
+    api('admin.users').then(function (users) {
+      var h = '<div class="section-title">Users</div>'
+        + '<div style="display:flex;gap:8px;margin-bottom:10px;"><input type="text" id="newEmail" placeholder="email@domain"><select id="newRole"><option>Viewer</option><option>Editor</option><option>Administrator</option></select><button class="btn primary" id="addUserBtn">Add</button></div>';
+      h += '<div class="glass table-wrap"><table class="data"><thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Added</th><th></th></tr></thead><tbody>';
+      users.forEach(function (u) {
+        h += '<tr><td>' + esc(u.email) + '</td><td><select data-role="' + u.userId + '">'
+          + ['Viewer','Editor','Administrator'].map(function (r) { return '<option' + (r === u.role ? ' selected' : '') + '>' + r + '</option>'; }).join('')
+          + '</select></td><td>' + esc(u.status) + '</td><td>' + esc(u.dateAdded) + '</td>'
+          + '<td><button class="btn sm ghost" data-togglestatus="' + u.userId + '" data-cur="' + esc(u.status) + '">' + (u.status === 'Suspended' ? 'Activate' : 'Suspend') + '</button></td></tr>';
+      });
+      h += '</tbody></table></div>';
+      $('#adminPanel').innerHTML = h;
+      $('#addUserBtn').addEventListener('click', function () { api('admin.addUser', { email: $('#newEmail').value.trim(), role: $('#newRole').value }).then(function () { toast('User saved', 'ok'); adminUsers(); }).catch(function (e) { toast(e.message, 'err'); }); });
+      Array.prototype.forEach.call(document.querySelectorAll('[data-role]'), function (sel) { sel.addEventListener('change', function () { api('admin.setRole', { userId: sel.getAttribute('data-role'), role: sel.value }).then(function () { toast('Role updated', 'ok'); }); }); });
+      bindData('[data-togglestatus]', 'data-togglestatus', function (v) {
+        var el = document.querySelector('[data-togglestatus="' + v + '"]'); var cur = el.getAttribute('data-cur');
+        api('admin.setUserStatus', { userId: v, status: cur === 'Suspended' ? 'Active' : 'Suspended' }).then(function () { toast('Status updated', 'ok'); adminUsers(); });
+      });
+    }).catch(function (e) { toast(e.message, 'err'); });
+  }
+  function adminAudit() {
+    api('admin.audit', { limit: 80 }).then(function (rows) {
+      var h = '<div class="section-title">Audit Log</div><div class="glass table-wrap"><table class="data"><thead><tr><th>Time</th><th>Action</th><th>Record</th><th>Result</th></tr></thead><tbody>'
+        + rows.map(function (r) { return '<tr><td>' + esc(r.Timestamp) + '</td><td>' + esc(r.Action) + '</td><td>' + esc(r.Affected_Record) + '</td><td>' + esc(r.Result) + '</td></tr>'; }).join('')
+        + '</tbody></table></div>';
+      $('#adminPanel').innerHTML = h;
+    }).catch(function (e) { toast(e.message, 'err'); });
+  }
+
+  /* ---- shared actions ----------------------------------------------------- */
+  function quickBookmark(sectionId) {
+    var cols = BOOT.collections || [];
+    openModal('<h2>Save bookmark</h2>'
+      + '<label class="field" style="margin-top:10px;">Collection<select id="bmCol">' + cols.map(function (c) { return '<option>' + esc(c) + '</option>'; }).join('') + '<option value="__new">+ New collection…</option></select></label>'
+      + '<label class="field" id="bmNewWrap" style="margin-top:10px;display:none;">New collection name<input type="text" id="bmNew"></label>'
+      + '<label class="field" style="margin-top:10px;">Label (optional)<input type="text" id="bmLabel"></label>'
+      + '<div class="foot"><button class="btn ghost" onclick="window.__closeModal()">Cancel</button><button class="btn primary" id="saveBm">Save</button></div>');
+    $('#bmCol').addEventListener('change', function () { $('#bmNewWrap').style.display = this.value === '__new' ? '' : 'none'; });
+    $('#saveBm').addEventListener('click', function () {
+      var col = $('#bmCol').value; if (col === '__new') col = $('#bmNew').value.trim() || 'General';
+      api('bookmarks.add', { sectionId: sectionId, collection: col, label: $('#bmLabel').value.trim() })
+        .then(function () { window.__closeModal(); toast('Bookmarked', 'ok'); }).catch(function (e) { toast(e.message, 'err'); });
+    });
+  }
+  function copyCitation(sectionId) {
+    api('docs.section', { sectionId: sectionId }).then(function (s) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(s.citation).then(function () { toast('Citation copied', 'ok'); }, function () { showCopyFallback(s.citation); });
+      } else { showCopyFallback(s.citation); }
+    }).catch(function (e) { toast(e.message, 'err'); });
+  }
+  function showCopyFallback(text) {
+    openModal('<h2>Citation</h2><p class="muted" style="font-size:13px;">Copy the citation below.</p>'
+      + '<textarea style="margin-top:8px;height:90px;" onclick="this.select()">' + esc(text) + '</textarea>'
+      + '<div class="foot"><button class="btn primary" onclick="window.__closeModal()">Done</button></div>');
+  }
+  function printSection(sectionId) {
+    api('export.printable', { sectionId: sectionId }).then(function (r) {
+      var w = window.open('', '_blank');
+      w.document.write('<html><head><title>Reference</title><style>body{font-family:Inter,Arial,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;color:#111;line-height:1.6;}</style></head><body>' + r.html + '</body></html>');
+      w.document.close(); w.focus(); setTimeout(function () { w.print(); }, 300);
+    }).catch(function (e) { toast(e.message, 'err'); });
+  }
+  function downloadText(filename, text) {
+    var blob = new Blob([text], { type: 'text/csv' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 1000);
+    toast('Download started', 'ok');
+  }
+  function confirmDialog(msg, onYes) {
+    openModal('<h2>Please confirm</h2><p style="font-size:14px;margin:10px 0 0;">' + esc(msg) + '</p>'
+      + '<div class="foot"><button class="btn ghost" onclick="window.__closeModal()">Cancel</button><button class="btn danger" id="confirmYes">Confirm</button></div>');
+    $('#confirmYes').addEventListener('click', function () { window.__closeModal(); onYes(); });
+  }
+  function disclaimerBox() { return '<div class="notice" style="margin-top:26px;">' + esc(BOOT.disclaimer || '') + '</div>'; }
+
+  /* ---- theme -------------------------------------------------------------- */
+  function applyTheme(mode) {
+    localStorage.setItem('theme', mode);
+    var root = document.documentElement;
+    if (mode === 'system') root.setAttribute('data-theme', '');
+    else root.setAttribute('data-theme', mode);
+  }
+
+  /* ---- global search bar + shortcuts -------------------------------------- */
+  function wireGlobalSearch() {
+    var input = $('#globalSearch');
+    var pop = $('#suggestPop');
+    var hlIndex = -1, items = [];
+    var doSuggest = debounce(function () {
+      var v = input.value.trim();
+      if (v.length < 2) { pop.classList.remove('show'); return; }
+      api('search.suggest', { prefix: v }).then(function (sug) {
+        api('search.history').then(function (hist) {
+          items = [];
+          var html = '';
+          if (hist && hist.length) {
+            html += '<div class="muted">Recent</div>';
+            hist.slice(0, 4).forEach(function (h) { items.push(h.q); html += '<div class="item" data-sug="' + esc(h.q) + '">🕑 ' + esc(h.q) + '</div>'; });
+          }
+          if (sug && sug.length) {
+            html += '<div class="muted">Suggestions</div>';
+            sug.forEach(function (s) { var q = s.split(' — ')[0]; items.push(q); html += '<div class="item" data-sug="' + esc(q) + '">' + esc(s) + '</div>'; });
+          }
+          pop.innerHTML = html || '<div class="muted">No suggestions</div>';
+          pop.classList.add('show');
+          Array.prototype.forEach.call(pop.querySelectorAll('[data-sug]'), function (el) {
+            el.addEventListener('mousedown', function (e) { e.preventDefault(); input.value = el.getAttribute('data-sug'); pop.classList.remove('show'); submitGlobal(); });
+          });
+        });
+      });
+    }, 180);
+    input.addEventListener('input', function () { hlIndex = -1; doSuggest(); });
+    input.addEventListener('focus', function () { if (input.value.trim().length >= 2) doSuggest(); });
+    input.addEventListener('blur', function () { setTimeout(function () { pop.classList.remove('show'); }, 150); });
+    input.addEventListener('keydown', function (e) {
+      var nodes = pop.querySelectorAll('.item');
+      if (e.key === 'ArrowDown') { e.preventDefault(); hlIndex = Math.min(hlIndex + 1, nodes.length - 1); hl(nodes); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); hlIndex = Math.max(hlIndex - 1, 0); hl(nodes); }
+      else if (e.key === 'Enter') { if (hlIndex >= 0 && nodes[hlIndex]) { input.value = nodes[hlIndex].getAttribute('data-sug'); } pop.classList.remove('show'); submitGlobal(); }
+      else if (e.key === 'Escape') { pop.classList.remove('show'); }
+    });
+    function hl(nodes) { Array.prototype.forEach.call(nodes, function (n, i) { n.classList.toggle('hl', i === hlIndex); }); }
+    function submitGlobal() { var v = input.value.trim(); if (v) go('search?q=' + encodeURIComponent(v)); }
+
+    document.addEventListener('keydown', function (e) {
+      if ((e.key === '/' || (e.key.toLowerCase() === 'k' && (e.ctrlKey || e.metaKey)))) {
+        var tag = (document.activeElement && document.activeElement.tagName) || '';
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+        e.preventDefault(); input.focus(); input.select();
+      }
+    });
+  }
+
+  /* ---- sidebar mobile ----------------------------------------------------- */
+  function closeSidebar() { $('#sidebar').classList.remove('open'); $('#overlay').classList.remove('show'); }
+  function initUi() {
+    $('#hamburger').addEventListener('click', function () { $('#sidebar').classList.toggle('open'); $('#overlay').classList.toggle('show'); });
+    $('#overlay').addEventListener('click', closeSidebar);
+    $('#themeToggle').addEventListener('click', function () {
+      var cur = document.documentElement.getAttribute('data-theme');
+      applyTheme(cur === 'dark' ? 'light' : 'dark');
+    });
+    var kbd = navigator.platform.toLowerCase().indexOf('mac') !== -1 ? '⌘K' : '/';
+    $('#searchKbd').textContent = kbd;
+    if (BOOT.user) {
+      $('#userName').textContent = BOOT.user.displayName;
+      $('#userRole').textContent = BOOT.user.role;
+      $('#userAvatar').textContent = (BOOT.user.displayName || '?').charAt(0).toUpperCase();
+    }
+  }
+
+  /* ---- not-configured screen ---------------------------------------------- */
+  function renderNotConfigured() {
+    $('#nav').innerHTML = '';
+    $('#view').innerHTML = '<div class="page-title">Setup required</div>'
+      + '<div class="glass card" style="margin-top:10px;"><p>The portal database has not been configured yet. An administrator must run the one-time setup from the Apps Script editor:</p>'
+      + '<pre style="background:var(--glass-bg);padding:14px;border-radius:10px;overflow:auto;">setup({ libraryFolderId: \'YOUR_DRIVE_FOLDER_ID\' })</pre>'
+      + '<p class="muted" style="font-size:13px;">This creates the Google Sheets database, builds the schema and seeds the document catalogue. See docs/DEPLOYMENT.md for full instructions.</p></div>';
+  }
+
+  /* ---- boot --------------------------------------------------------------- */
+  applyTheme(localStorage.getItem('theme') || 'system');
+  initUi();
+  if (!BOOT.configured) { renderNotConfigured(); return; }
+  if (BOOT.error) { $('#view').innerHTML = errorBox('Initialisation error: ' + BOOT.error); }
+  renderNav();
+  wireGlobalSearch();
+  window.addEventListener('hashchange', route);
+  if (!location.hash) { location.hash = '#/dashboard'; } else { route(); }
+
+})();
+</script>
