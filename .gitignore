@@ -9,3 +9,6 @@ node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# generated download bundles
+aerodrome-portal-src.zip
