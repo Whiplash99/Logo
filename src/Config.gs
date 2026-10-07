@@ -116,7 +116,15 @@ var CONFIG = (function () {
       'Aerodrome Inspections',
       'Safety Management Systems',
       'Aerodrome Certification',
-      'Airside Operations'
+      'Airside Operations',
+      'Declared Distances',
+      'Clearways and Stopways',
+      'Frangibility',
+      'Pavement Classification (PCN / ACR)',
+      'FOD Management',
+      'Disabled Aircraft Removal',
+      'Aerodrome Data and Reporting',
+      'Heliports (Annex 14 Volume II)'
     ],
 
     /**
@@ -208,6 +216,19 @@ var CONFIG = (function () {
           { name: 'Frangibility', keywords: ['frangible', 'frangibility'] },
           { name: 'Drainage', keywords: ['drainage', 'surface water'] }
         ]
+      },
+      {
+        group: 'Heliports (Annex 14 Volume II)',
+        subjects: [
+          { name: 'Heliport reference code and data', keywords: ['heliport', 'heliport reference', 'heliport data', 'D-value'] },
+          { name: 'Final approach and take-off area (FATO)', keywords: ['final approach and take-off area', 'FATO'] },
+          { name: 'Touchdown and lift-off area (TLOF)', keywords: ['touchdown and lift-off area', 'TLOF'] },
+          { name: 'Heliport safety areas', keywords: ['safety area', 'heliport safety area'] },
+          { name: 'Helicopter ground taxiways and air taxiways', keywords: ['ground taxiway', 'air taxiway', 'helicopter taxi'] },
+          { name: 'Heliport obstacle environment', keywords: ['obstacle limitation', 'approach surface', 'take-off climb surface', 'heliport obstacle'] },
+          { name: 'Heliport markings and markers', keywords: ['heliport marking', 'heliport identification marking', 'touchdown marking'] },
+          { name: 'Heliport lighting', keywords: ['heliport beacon', 'FATO lighting', 'TLOF lighting', 'heliport light'] }
+        ]
       }
     ],
 
@@ -242,7 +263,13 @@ var CONFIG = (function () {
       'AIP': 'aeronautical information publication',
       'NOTAM': 'notice to airmen',
       'SARPs': 'standards and recommended practices',
-      'SARP': 'standard and recommended practice'
+      'SARP': 'standard and recommended practice',
+      'FATO': 'final approach and take-off area',
+      'TLOF': 'touchdown and lift-off area',
+      'RESCUE': 'rescue and firefighting',
+      'GRF': 'global reporting format',
+      'RWYCC': 'runway condition code',
+      'RCR': 'runway condition report'
     },
 
     /**

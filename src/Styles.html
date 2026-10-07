@@ -31,6 +31,10 @@
   --glass-border: rgba(255,255,255,.65);
   --glass-shadow: 0 8px 30px rgba(17,48,82,.12), 0 2px 6px rgba(17,48,82,.06);
   --glass-blur: 18px;
+  /* specular edge highlight + inner sheen for the liquid-glass look */
+  --glass-highlight: rgba(255,255,255,.85);
+  --glass-inner: inset 0 1px 0 rgba(255,255,255,.7), inset 0 0 0 1px rgba(255,255,255,.08);
+  --glass-sheen: linear-gradient(140deg, rgba(255,255,255,.35) 0%, rgba(255,255,255,0) 42%);
 
   /* Provision type colours */
   --t-standard: #1f8f4e;
@@ -61,6 +65,9 @@
   --glass-bg-strong: rgba(20,36,60,.75);
   --glass-border: rgba(255,255,255,.12);
   --glass-shadow: 0 10px 34px rgba(0,0,0,.45), 0 2px 8px rgba(0,0,0,.35);
+  --glass-highlight: rgba(255,255,255,.18);
+  --glass-inner: inset 0 1px 0 rgba(255,255,255,.14), inset 0 0 0 1px rgba(255,255,255,.04);
+  --glass-sheen: linear-gradient(140deg, rgba(255,255,255,.10) 0%, rgba(255,255,255,0) 40%);
 
   --t-standard: #4cc47e;
   --t-recommended: #e0b25a;
@@ -83,6 +90,9 @@
     --glass-bg-strong: rgba(20,36,60,.75);
     --glass-border: rgba(255,255,255,.12);
     --glass-shadow: 0 10px 34px rgba(0,0,0,.45), 0 2px 8px rgba(0,0,0,.35);
+    --glass-highlight: rgba(255,255,255,.18);
+    --glass-inner: inset 0 1px 0 rgba(255,255,255,.14), inset 0 0 0 1px rgba(255,255,255,.04);
+    --glass-sheen: linear-gradient(140deg, rgba(255,255,255,.10) 0%, rgba(255,255,255,0) 40%);
     --t-standard: #4cc47e; --t-recommended: #e0b25a; --t-note: #9fb0c7;
     --t-definition: #b393f0; --t-guidance: #6bb0ff;
     color-scheme: dark;
@@ -108,12 +118,31 @@ body {
 
 /* ---- glass primitive ----------------------------------------------------- */
 .glass {
+  position: relative;
   background: var(--glass-bg);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(140%);
-  backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  backdrop-filter: blur(var(--glass-blur)) saturate(150%);
   border: 1px solid var(--glass-border);
-  box-shadow: var(--glass-shadow);
+  box-shadow: var(--glass-shadow), var(--glass-inner);
   border-radius: var(--radius);
+  isolation: isolate;
+}
+/* diagonal specular sheen — the "liquid" catching light along the top-left */
+.glass::before {
+  content: "";
+  position: absolute; inset: 0;
+  border-radius: inherit;
+  background: var(--glass-sheen);
+  opacity: .9;
+  pointer-events: none;
+  z-index: -1;
+}
+/* crisp hairline highlight on the very top edge */
+.glass::after {
+  content: "";
+  position: absolute; left: 12%; right: 12%; top: 0; height: 1px;
+  background: linear-gradient(90deg, transparent, var(--glass-highlight), transparent);
+  pointer-events: none; z-index: -1;
 }
 .glass-strong { background: var(--glass-bg-strong); }
 
@@ -383,6 +412,43 @@ table.data tr:hover td { background: var(--accent-soft); }
 
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
+
+/* ---- liquid-glass ambience ---------------------------------------------- */
+/* slow-drifting light orbs behind the frosted panels (very subtle) */
+body::before {
+  content: "";
+  position: fixed; inset: -20vmax; z-index: -1; pointer-events: none;
+  background:
+    radial-gradient(42vmax 42vmax at 18% 22%, rgba(47,129,247,.22), transparent 60%),
+    radial-gradient(38vmax 38vmax at 82% 30%, rgba(67,198,232,.18), transparent 60%),
+    radial-gradient(34vmax 34vmax at 60% 88%, rgba(123,104,238,.14), transparent 62%);
+  filter: blur(14px);
+  animation: drift 42s ease-in-out infinite alternate;
+}
+@keyframes drift {
+  0%   { transform: translate3d(0,0,0) scale(1); }
+  50%  { transform: translate3d(2.5vmax,-2vmax,0) scale(1.06); }
+  100% { transform: translate3d(-2vmax,2.5vmax,0) scale(1.02); }
+}
+
+/* unify focus visibility for keyboard users */
+:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft), 0 0 0 1px var(--accent); border-radius: 8px; }
+
+/* give the active nav item a faint liquid sheen sweep */
+.nav-item.active::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background: linear-gradient(120deg, rgba(255,255,255,.28), transparent 45%);
+}
+.nav-item { position: relative; overflow: hidden; }
+
+/* lift + brighten glass cards on hover */
+.doc-card:hover, .result:hover, .stat:hover { box-shadow: var(--glass-shadow), var(--glass-inner), 0 18px 44px rgba(17,48,82,.18); }
+
+/* honour reduced-motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  body::before { animation: none; }
+  *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .08s !important; }
+}
 
 /* ---- responsive ---------------------------------------------------------- */
 @media (max-width: 960px) {
