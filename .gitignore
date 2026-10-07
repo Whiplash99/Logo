@@ -1,0 +1,14 @@
+# clasp local project link (contains your scriptId)
+src/.clasp.json
+.clasp.json
+
+# clasp / node
+node_modules/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# generated download bundles
+aerodrome-portal-src.zip
